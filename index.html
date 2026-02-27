@@ -673,17 +673,21 @@ input:focus, select:focus {
 </head>
 <body>
 
-<!-- Lock Screen -->
+<!-- Login Screen -->
 <div id="lockScreen">
   <div class="lock-box">
     <div class="lock-logo">KAKEIBO</div>
     <div class="lock-sub">🌸 家計簿 🌸</div>
-    <div id="lockSyncStatus" style="font-family:'Zen Maru Gothic',sans-serif;font-size:10px;color:rgba(255,255,255,0.6);margin-bottom:20px;letter-spacing:1px;min-height:14px;"></div>
-    <div class="lock-label">パスワード</div>
-    <input type="password" id="lockPassword" placeholder="••••••••" autocomplete="current-password" onkeydown="if(event.key==='Enter')tryUnlock()">
-    <button id="lockBtn" onclick="tryUnlock()">ひらく 🌸</button>
+    <div id="lockSyncStatus" style="font-family:'Zen Maru Gothic',sans-serif;font-size:10px;color:rgba(255,255,255,0.6);margin-bottom:16px;letter-spacing:1px;min-height:14px;"></div>
+    <div class="lock-label">メールアドレス</div>
+    <input type="email" id="lockEmail" placeholder="example@email.com" autocomplete="email"
+      style="letter-spacing:0;font-size:15px;margin-bottom:10px"
+      onkeydown="if(event.key==='Enter')document.getElementById('lockPassword').focus()">
+    <div class="lock-label" style="margin-top:4px">パスワード</div>
+    <input type="password" id="lockPassword" placeholder="••••••••" autocomplete="current-password"
+      onkeydown="if(event.key==='Enter')tryLogin()">
+    <button id="lockBtn" onclick="tryLogin()">ログイン 🌸</button>
     <div id="lockError"></div>
-    <div class="lock-hint">初回パスワード: kakeibo</div>
   </div>
 </div>
 
@@ -691,8 +695,8 @@ input:focus, select:focus {
 <div id="pwModal">
   <div class="modal-box">
     <div class="modal-title">🔑 パスワードを変更</div>
-    <div class="form-row"><label>現在のパスワード</label><input type="password" id="pwCurrent" placeholder="現在のパスワード"></div>
-    <div class="form-row"><label>新しいパスワード（4文字以上）</label><input type="password" id="pwNew" placeholder="新しいパスワード"></div>
+    <div class="form-row"><label>現在のパスワード（再認証）</label><input type="password" id="pwCurrent" placeholder="現在のパスワード"></div>
+    <div class="form-row"><label>新しいパスワード（6文字以上）</label><input type="password" id="pwNew" placeholder="新しいパスワード"></div>
     <div class="form-row"><label>確認</label><input type="password" id="pwConfirm" placeholder="もう一度入力"></div>
     <div id="pwModalError" style="font-family:'Zen Maru Gothic',sans-serif;font-size:11px;color:var(--rose);min-height:16px;margin-bottom:4px;"></div>
     <div class="modal-actions">
@@ -765,6 +769,7 @@ input:focus, select:focus {
     </div>
     <button id="changePwBtn" onclick="openPwModal()">🔑 PW変更</button>
     <button id="changePwBtn" onclick="openBackupModal()" style="background:rgba(255,255,255,0.2)">💾 バックアップ</button>
+    <button id="changePwBtn" onclick="logout()" style="background:rgba(255,255,255,0.15)">🚪 ログアウト</button>
   </div>
 </header>
 
@@ -1031,77 +1036,66 @@ const firebaseConfig = {
 firebase.initializeApp(firebaseConfig);
 const auth = firebase.auth();
 const db   = firebase.database();
+const FB_PATH = 'kakeibo'; // 全員共有のパス
 
-let fbUid = null;          // 認証後にセット
-let fbListening = false;   // リスナー重複防止
-let saveTimer = null;      // デバウンス用
+let fbListening = false;
+let saveTimer   = null;
 
-// Firebase への書き込み（デバウンス付き：300ms待ってまとめて送信）
+// ===== Firebase 書き込み =====
 function save() {
-  // localStorageにも保存（オフライン時のフォールバック）
   localStorage.setItem('kakeibo_tx', JSON.stringify(transactions));
-  if (!fbUid) return;
+  if (!auth.currentUser) return;
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => fbSave(), 300);
+  saveTimer = setTimeout(fbSave, 400);
 }
 
 function fbSave() {
-  if (!fbUid) return;
-  const ref = db.ref(`users/${fbUid}`);
-  ref.update({
-    transactions:     transactions,
-    updatedAt:        Date.now(),
-  }).catch(e => console.warn('Firebase save error:', e));
+  if (!auth.currentUser) return;
+  db.ref(`${FB_PATH}/transactions`).set(transactions)
+    .then(() => setSyncStatus('synced'))
+    .catch(e => { console.warn('save error', e); setSyncStatus('error'); });
 }
 
-// 設定（ルール・カテゴリ・デフォルト収入）をFirebaseに保存
 function saveSettings() {
-  if (!fbUid) return;
-  db.ref(`users/${fbUid}/settings`).set({
+  if (!auth.currentUser) return;
+  db.ref(`${FB_PATH}/settings`).set({
     customRules:      getCustomRules(),
     customCategories: getCustomCats(),
     defaultIncome:    getDefaultIncome(),
-  }).catch(e => console.warn('Firebase settings save error:', e));
+  }).catch(e => console.warn('settings save error', e));
 }
 
-// Firebaseからデータを読み込んでリアルタイム同期開始
+// ===== Firebase リアルタイム同期 =====
 function startFirebaseSync() {
   if (fbListening) return;
   fbListening = true;
+  setSyncStatus('syncing');
 
-  const ref = db.ref(`users/${fbUid}`);
-
-  // 初回ロード＆リアルタイム更新
-  ref.on('value', snapshot => {
-    const data = snapshot.val();
-    if (!data) return;  // 初回空なら何もしない
-
-    // 取引データを反映
-    if (Array.isArray(data.transactions)) {
-      transactions = data.transactions;
+  // 取引データ
+  db.ref(`${FB_PATH}/transactions`).on('value', snap => {
+    const data = snap.val();
+    if (Array.isArray(data)) {
+      transactions = data;
       localStorage.setItem('kakeibo_tx', JSON.stringify(transactions));
+      render();
     }
-
-    // 設定を反映
-    if (data.settings) {
-      const s = data.settings;
-      if (s.customRules)      { saveCustomRules(s.customRules); }
-      if (s.customCategories) { saveCustomCats(s.customCategories); }
-      if (s.defaultIncome)    { localStorage.setItem(DEFAULT_INCOME_KEY, JSON.stringify(s.defaultIncome)); }
-
-      // UI再構築
-      CATEGORIES = buildCategories();
-      setType(currentType);
-      initRulesUI();
-      initDefaultIncomeUI();
-      renderCustomCats();
-    }
-
-    render();
     setSyncStatus('synced');
-  }, e => {
-    console.warn('Firebase read error:', e);
-    setSyncStatus('error');
+  }, () => setSyncStatus('error'));
+
+  // 設定データ
+  db.ref(`${FB_PATH}/settings`).on('value', snap => {
+    const s = snap.val();
+    if (!s) return;
+    // localStorageに書く（saveSettings経由のループを防ぐため直接書く）
+    if (s.customRules)      localStorage.setItem(CUSTOM_RULES_KEY, JSON.stringify(s.customRules));
+    if (s.customCategories) localStorage.setItem(CUSTOM_CATS_KEY,  JSON.stringify(s.customCategories));
+    if (s.defaultIncome)    localStorage.setItem(DEFAULT_INCOME_KEY, JSON.stringify(s.defaultIncome));
+    CATEGORIES = buildCategories();
+    setType(currentType);
+    initRulesUI();
+    initDefaultIncomeUI();
+    renderCustomCats();
+    render();
   });
 }
 
@@ -1109,33 +1103,123 @@ function setSyncStatus(status) {
   const el = document.getElementById('wsStatus');
   if (!el) return;
   const map = {
-    synced:       { text: '☁ 同期済み',   color: 'rgba(255,255,255,0.9)' },
-    syncing:      { text: '☁ 同期中...',  color: 'rgba(255,255,255,0.6)' },
-    disconnected: { text: '○ 未接続',     color: 'rgba(255,255,255,0.5)' },
-    error:        { text: '✕ 同期エラー', color: 'rgba(255,255,255,0.7)' },
+    synced:  { text: '☁ 同期済み',  color: 'rgba(255,255,255,0.9)' },
+    syncing: { text: '☁ 同期中...', color: 'rgba(255,255,255,0.6)' },
+    error:   { text: '✕ 同期エラー',color: 'rgba(255,255,255,0.7)' },
   };
-  const s = map[status] || map.disconnected;
+  const s = map[status] || map.syncing;
   el.textContent = s.text;
   el.style.color  = s.color;
 }
 
-// Firebase Anonymous Auth でサインイン（アプリPWと連動）
-async function firebaseSignIn() {
+// ===== ログイン画面 =====
+async function tryLogin() {
+  const email = document.getElementById('lockEmail').value.trim();
+  const pw    = document.getElementById('lockPassword').value;
+  const errEl = document.getElementById('lockError');
+  const btn   = document.getElementById('lockBtn');
+  if (!email || !pw) { errEl.textContent = 'メールアドレスとパスワードを入力してください'; return; }
+
+  btn.textContent = '接続中...';
+  btn.disabled    = true;
+  errEl.textContent = '';
+
+  const ls = document.getElementById('lockSyncStatus');
+  if (ls) ls.textContent = 'Firebaseに接続中...';
+
   try {
-    const ls = document.getElementById('lockSyncStatus');
-    if (ls) ls.textContent = 'クラウドに接続中...';
-    const result = await auth.signInAnonymously();
-    fbUid = result.user.uid;
-    if (ls) ls.textContent = '';
-    return true;
+    await auth.signInWithEmailAndPassword(email, pw);
+    // onAuthStateChanged が起動してアプリを開く
   } catch(e) {
-    console.warn('Firebase auth error:', e);
-    const ls = document.getElementById('lockSyncStatus');
-    if (ls) ls.textContent = '⚠ オフラインモードで動作中';
-    return false;
+    btn.textContent = 'ログイン 🌸';
+    btn.disabled    = false;
+    if (ls) ls.textContent = '';
+    const msg = {
+      'auth/user-not-found':  'メールアドレスが登録されていません',
+      'auth/wrong-password':  'パスワードが違います 🌹',
+      'auth/invalid-email':   'メールアドレスの形式が正しくありません',
+      'auth/too-many-requests':'試行回数が多すぎます。しばらくお待ちください',
+      'auth/invalid-credential': 'メールアドレスまたはパスワードが違います 🌹',
+    };
+    errEl.textContent = msg[e.code] || `エラー: ${e.message}`;
+    document.getElementById('lockPassword').classList.add('shake');
+    setTimeout(() => document.getElementById('lockPassword').classList.remove('shake'), 400);
   }
 }
-function fmt(n) { return '¥' + Math.abs(n).toLocaleString('ja-JP'); }
+
+// ===== ログアウト =====
+function logout() {
+  if (!confirm('ログアウトしますか？')) return;
+  fbListening = false;
+  auth.signOut().then(() => {
+    location.reload();
+  });
+}
+
+// ===== パスワード変更（Firebase経由）=====
+function openPwModal() {
+  document.getElementById('pwCurrent').value = '';
+  document.getElementById('pwNew').value     = '';
+  document.getElementById('pwConfirm').value = '';
+  document.getElementById('pwModalError').textContent = '';
+  document.getElementById('pwModal').classList.add('open');
+}
+function closePwModal() { document.getElementById('pwModal').classList.remove('open'); }
+
+async function saveNewPassword() {
+  const cur   = document.getElementById('pwCurrent').value;
+  const nw    = document.getElementById('pwNew').value;
+  const cf    = document.getElementById('pwConfirm').value;
+  const errEl = document.getElementById('pwModalError');
+
+  if (!cur || !nw || !cf) { errEl.textContent = 'すべて入力してください'; return; }
+  if (nw.length < 6)       { errEl.textContent = '新しいパスワードは6文字以上にしてください'; return; }
+  if (nw !== cf)            { errEl.textContent = 'パスワードが一致しません'; return; }
+
+  try {
+    // 再認証してからパスワード変更
+    const user       = auth.currentUser;
+    const credential = firebase.auth.EmailAuthProvider.credential(user.email, cur);
+    await user.reauthenticateWithCredential(credential);
+    await user.updatePassword(nw);
+    closePwModal();
+    alert('パスワードを変更しました 🌸');
+  } catch(e) {
+    const msg = {
+      'auth/wrong-password':     '現在のパスワードが違います',
+      'auth/too-many-requests':  '試行回数が多すぎます。しばらく待ってください',
+      'auth/invalid-credential': '現在のパスワードが違います',
+    };
+    errEl.textContent = msg[e.code] || `エラー: ${e.message}`;
+  }
+}
+
+// ===== 認証状態の監視（メイン起動ロジック）=====
+auth.onAuthStateChanged(user => {
+  if (user) {
+    // ログイン済み → アプリ表示
+    document.getElementById('lockScreen').classList.add('hidden');
+    document.getElementById('lockSyncStatus') && (document.getElementById('lockSyncStatus').textContent = '');
+    if (!document.getElementById('app-initialized')) {
+      // 初回のみinit()
+      const marker = document.createElement('span');
+      marker.id = 'app-initialized';
+      document.body.appendChild(marker);
+      init();
+    }
+    startFirebaseSync();
+  } else {
+    // 未ログイン → ログイン画面
+    fbListening = false;
+    document.getElementById('lockScreen').classList.remove('hidden');
+    const btn = document.getElementById('lockBtn');
+    if (btn) { btn.textContent = 'ログイン 🌸'; btn.disabled = false; }
+    document.getElementById('lockEmail') && document.getElementById('lockEmail').focus();
+  }
+});
+
+// =========== ユーティリティ ===========
+function escHtml(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function currentMonthKey() {
   return `${currentDate.getFullYear()}-${String(currentDate.getMonth()+1).padStart(2,'0')}`;
 }
@@ -1953,58 +2037,7 @@ function importBackup(input) {
   reader.readAsText(file, 'UTF-8');
 }
 
-// =========== ユーティリティ ===========
-function escHtml(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-
-// =========== パスワード ===========
-const DEFAULT_PW='kakeibo', PW_KEY='kakeibo_pw_hash', SESSION_KEY='kakeibo_unlocked';
-function hashPw(pw){ let h=0;for(let i=0;i<pw.length;i++)h=Math.imul(31,h)+pw.charCodeAt(i)|0;return String(h>>>0); }
-function getStoredHash(){ return localStorage.getItem(PW_KEY)||hashPw(DEFAULT_PW); }
-function isUnlocked(){ return sessionStorage.getItem(SESSION_KEY)==='yes'; }
-
-async function tryUnlock(){
-  const input=document.getElementById('lockPassword').value;
-  if(!input) return;
-  if(hashPw(input)===getStoredHash()){
-    sessionStorage.setItem(SESSION_KEY,'yes');
-    // Firebase認証
-    await firebaseSignIn();
-    document.getElementById('lockScreen').classList.add('hidden');
-    document.getElementById('lockError').textContent='';
-    init();
-    if(fbUid) startFirebaseSync();
-  } else {
-    const inp=document.getElementById('lockPassword');
-    inp.classList.add('shake');
-    setTimeout(()=>inp.classList.remove('shake'),400);
-    document.getElementById('lockError').textContent='パスワードが違います 🌹';
-    inp.value='';
-  }
-}
-function openPwModal(){ document.getElementById('pwCurrent').value='';document.getElementById('pwNew').value='';document.getElementById('pwConfirm').value='';document.getElementById('pwModalError').textContent='';document.getElementById('pwModal').classList.add('open'); }
-function closePwModal(){ document.getElementById('pwModal').classList.remove('open'); }
-function saveNewPassword(){
-  const cur=document.getElementById('pwCurrent').value;
-  const nw=document.getElementById('pwNew').value;
-  const cf=document.getElementById('pwConfirm').value;
-  const errEl=document.getElementById('pwModalError');
-  if(hashPw(cur)!==getStoredHash()){errEl.textContent='現在のパスワードが違います';return;}
-  if(nw.length<4){errEl.textContent='4文字以上で設定してください';return;}
-  if(nw!==cf){errEl.textContent='パスワードが一致しません';return;}
-  localStorage.setItem(PW_KEY,hashPw(nw));
-  closePwModal(); alert('パスワードを変更しました 🌸');
-}
-
-// =========== Start ===========
-if(isUnlocked()){
-  document.getElementById('lockScreen').classList.add('hidden');
-  firebaseSignIn().then(() => {
-    init();
-    if(fbUid) startFirebaseSync();
-  });
-} else {
-  document.getElementById('lockPassword').focus();
-}
+function fmt(n) { return '¥' + Math.abs(n).toLocaleString('ja-JP'); }
 </script>
 </body>
 </html>
