@@ -6,6 +6,10 @@
 <title>家計簿 — KAKEIBO</title>
 <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500;700&family=Zen+Maru+Gothic:wght@400;500;700&family=Pacifico&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<!-- Firebase -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
 <style>
 :root {
   --rose:     #f4768a;
@@ -674,6 +678,7 @@ input:focus, select:focus {
   <div class="lock-box">
     <div class="lock-logo">KAKEIBO</div>
     <div class="lock-sub">🌸 家計簿 🌸</div>
+    <div id="lockSyncStatus" style="font-family:'Zen Maru Gothic',sans-serif;font-size:10px;color:rgba(255,255,255,0.6);margin-bottom:20px;letter-spacing:1px;min-height:14px;"></div>
     <div class="lock-label">パスワード</div>
     <input type="password" id="lockPassword" placeholder="••••••••" autocomplete="current-password" onkeydown="if(event.key==='Enter')tryUnlock()">
     <button id="lockBtn" onclick="tryUnlock()">ひらく 🌸</button>
@@ -968,6 +973,7 @@ function getCustomCats() {
 }
 function saveCustomCats(cats) {
   localStorage.setItem(CUSTOM_CATS_KEY, JSON.stringify(cats));
+  saveSettings();
 }
 
 // CATEGORIES は動的に構築（カスタムカテゴリを「その他」の直前に挿入）
@@ -1012,7 +1018,123 @@ function init() {
   render();
 }
 
-function save() { localStorage.setItem('kakeibo_tx', JSON.stringify(transactions)); }
+// =========== Firebase 初期化 ===========
+const firebaseConfig = {
+  apiKey:            "AIzaSyAV8t7WsV88_UYRv0z9GuU8S7BgpV80ld4",
+  authDomain:        "kakeibo-b949c.firebaseapp.com",
+  databaseURL:       "https://kakeibo-b949c-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId:         "kakeibo-b949c",
+  storageBucket:     "kakeibo-b949c.firebasestorage.app",
+  messagingSenderId: "656299392281",
+  appId:             "1:656299392281:web:2eb6b71bc05d8591045988"
+};
+firebase.initializeApp(firebaseConfig);
+const auth = firebase.auth();
+const db   = firebase.database();
+
+let fbUid = null;          // 認証後にセット
+let fbListening = false;   // リスナー重複防止
+let saveTimer = null;      // デバウンス用
+
+// Firebase への書き込み（デバウンス付き：300ms待ってまとめて送信）
+function save() {
+  // localStorageにも保存（オフライン時のフォールバック）
+  localStorage.setItem('kakeibo_tx', JSON.stringify(transactions));
+  if (!fbUid) return;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => fbSave(), 300);
+}
+
+function fbSave() {
+  if (!fbUid) return;
+  const ref = db.ref(`users/${fbUid}`);
+  ref.update({
+    transactions:     transactions,
+    updatedAt:        Date.now(),
+  }).catch(e => console.warn('Firebase save error:', e));
+}
+
+// 設定（ルール・カテゴリ・デフォルト収入）をFirebaseに保存
+function saveSettings() {
+  if (!fbUid) return;
+  db.ref(`users/${fbUid}/settings`).set({
+    customRules:      getCustomRules(),
+    customCategories: getCustomCats(),
+    defaultIncome:    getDefaultIncome(),
+  }).catch(e => console.warn('Firebase settings save error:', e));
+}
+
+// Firebaseからデータを読み込んでリアルタイム同期開始
+function startFirebaseSync() {
+  if (fbListening) return;
+  fbListening = true;
+
+  const ref = db.ref(`users/${fbUid}`);
+
+  // 初回ロード＆リアルタイム更新
+  ref.on('value', snapshot => {
+    const data = snapshot.val();
+    if (!data) return;  // 初回空なら何もしない
+
+    // 取引データを反映
+    if (Array.isArray(data.transactions)) {
+      transactions = data.transactions;
+      localStorage.setItem('kakeibo_tx', JSON.stringify(transactions));
+    }
+
+    // 設定を反映
+    if (data.settings) {
+      const s = data.settings;
+      if (s.customRules)      { saveCustomRules(s.customRules); }
+      if (s.customCategories) { saveCustomCats(s.customCategories); }
+      if (s.defaultIncome)    { localStorage.setItem(DEFAULT_INCOME_KEY, JSON.stringify(s.defaultIncome)); }
+
+      // UI再構築
+      CATEGORIES = buildCategories();
+      setType(currentType);
+      initRulesUI();
+      initDefaultIncomeUI();
+      renderCustomCats();
+    }
+
+    render();
+    setSyncStatus('synced');
+  }, e => {
+    console.warn('Firebase read error:', e);
+    setSyncStatus('error');
+  });
+}
+
+function setSyncStatus(status) {
+  const el = document.getElementById('wsStatus');
+  if (!el) return;
+  const map = {
+    synced:       { text: '☁ 同期済み',   color: 'rgba(255,255,255,0.9)' },
+    syncing:      { text: '☁ 同期中...',  color: 'rgba(255,255,255,0.6)' },
+    disconnected: { text: '○ 未接続',     color: 'rgba(255,255,255,0.5)' },
+    error:        { text: '✕ 同期エラー', color: 'rgba(255,255,255,0.7)' },
+  };
+  const s = map[status] || map.disconnected;
+  el.textContent = s.text;
+  el.style.color  = s.color;
+}
+
+// Firebase Anonymous Auth でサインイン（アプリPWと連動）
+async function firebaseSignIn() {
+  try {
+    const ls = document.getElementById('lockSyncStatus');
+    if (ls) ls.textContent = 'クラウドに接続中...';
+    const result = await auth.signInAnonymously();
+    fbUid = result.user.uid;
+    if (ls) ls.textContent = '';
+    return true;
+  } catch(e) {
+    console.warn('Firebase auth error:', e);
+    const ls = document.getElementById('lockSyncStatus');
+    if (ls) ls.textContent = '⚠ オフラインモードで動作中';
+    return false;
+  }
+}
 function fmt(n) { return '¥' + Math.abs(n).toLocaleString('ja-JP'); }
 function currentMonthKey() {
   return `${currentDate.getFullYear()}-${String(currentDate.getMonth()+1).padStart(2,'0')}`;
@@ -1343,6 +1465,7 @@ function getCustomRules() {
 }
 function saveCustomRules(rules) {
   localStorage.setItem(CUSTOM_RULES_KEY, JSON.stringify(rules));
+  saveSettings();
 }
 
 function addCustomRule() {
@@ -1663,7 +1786,7 @@ function saveDefaultIncome(){
   const v1=parseInt(document.getElementById('defaultIncome1').value)||0;
   const v2=parseInt(document.getElementById('defaultIncome2').value)||0;
   localStorage.setItem(DEFAULT_INCOME_KEY,JSON.stringify({person1:v1,person2:v2}));
-  // ★ 修正：保存と同時に今月のappliedキーを削除してから強制再適用
+  saveSettings();
   const key=`${currentDate.getFullYear()}-${String(currentDate.getMonth()+1).padStart(2,'0')}`;
   localStorage.removeItem(`${DEFAULT_INCOME_APPLIED_KEY}_${key}`);
   applyDefaultIncomeForMonth(currentDate.getFullYear(),currentDate.getMonth()+1,true);
@@ -1839,14 +1962,17 @@ function hashPw(pw){ let h=0;for(let i=0;i<pw.length;i++)h=Math.imul(31,h)+pw.ch
 function getStoredHash(){ return localStorage.getItem(PW_KEY)||hashPw(DEFAULT_PW); }
 function isUnlocked(){ return sessionStorage.getItem(SESSION_KEY)==='yes'; }
 
-function tryUnlock(){
+async function tryUnlock(){
   const input=document.getElementById('lockPassword').value;
   if(!input) return;
   if(hashPw(input)===getStoredHash()){
     sessionStorage.setItem(SESSION_KEY,'yes');
+    // Firebase認証
+    await firebaseSignIn();
     document.getElementById('lockScreen').classList.add('hidden');
     document.getElementById('lockError').textContent='';
-    init(); connectWS();
+    init();
+    if(fbUid) startFirebaseSync();
   } else {
     const inp=document.getElementById('lockPassword');
     inp.classList.add('shake');
@@ -1872,7 +1998,10 @@ function saveNewPassword(){
 // =========== Start ===========
 if(isUnlocked()){
   document.getElementById('lockScreen').classList.add('hidden');
-  init(); connectWS();
+  firebaseSignIn().then(() => {
+    init();
+    if(fbUid) startFirebaseSync();
+  });
 } else {
   document.getElementById('lockPassword').focus();
 }
